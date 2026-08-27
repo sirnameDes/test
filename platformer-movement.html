@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>2D Platformer Walking System</title>
+<style>
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: #1e1e2e;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: sans-serif;
+  }
+  canvas {
+    background: #2b2b40;
+    border: 2px solid #555;
+    display: block;
+  }
+  #hud {
+    position: fixed;
+    top: 10px;
+    left: 10px;
+    color: #ddd;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+</style>
+</head>
+<body>
+<div id="hud">
+  A/D or ←/→ : walk<br>
+  Shift : run<br>
+  Space or W or ↑ : jump<br>
+</div>
+<canvas id="game" width="800" height="450"></canvas>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+// ---- World / physics constants ----
+const GRAVITY = 0.6;
+const WALK_SPEED = 3;
+const RUN_SPEED = 6;
+const JUMP_FORCE = -12;
+const FRICTION = 0.8; // how quickly you stop when no input (0-1, closer to 1 = more slide)
+const GROUND_Y = 400;
+
+// ---- Player state ----
+const player = {
+  x: 100,
+  y: GROUND_Y - 40,
+  width: 30,
+  height: 40,
+  vx: 0,
+  vy: 0,
+  onGround: false,
+  facing: 1, // 1 = right, -1 = left
+};
+
+// ---- Input tracking ----
+const keys = {};
+window.addEventListener('keydown', e => keys[e.code] = true);
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+function handleInput() {
+  const moveLeft = keys['ArrowLeft'] || keys['KeyA'];
+  const moveRight = keys['ArrowRight'] || keys['KeyD'];
+  const running = keys['ShiftLeft'] || keys['ShiftRight'];
+  const jumpPressed = keys['Space'] || keys['ArrowUp'] || keys['KeyW'];
+
+  const speed = running ? RUN_SPEED : WALK_SPEED;
+
+  if (moveLeft && !moveRight) {
+    player.vx = -speed;
+    player.facing = -1;
+  } else if (moveRight && !moveLeft) {
+    player.vx = speed;
+    player.facing = 1;
+  } else {
+    // no horizontal input -> apply friction so player eases to a stop
+    player.vx *= FRICTION;
+    if (Math.abs(player.vx) < 0.1) player.vx = 0;
+  }
+
+  // Jump only allowed when on the ground (prevents mid-air jumping)
+  if (jumpPressed && player.onGround) {
+    player.vy = JUMP_FORCE;
+    player.onGround = false;
+  }
+}
+
+function applyPhysics() {
+  // gravity always pulls down
+  player.vy += GRAVITY;
+
+  // move player by velocity
+  player.x += player.vx;
+  player.y += player.vy;
+
+  // simple ground collision
+  if (player.y + player.height >= GROUND_Y) {
+    player.y = GROUND_Y - player.height;
+    player.vy = 0;
+    player.onGround = true;
+  } else {
+    player.onGround = false;
+  }
+
+  // keep player inside canvas horizontally
+  player.x = Math.max(0, Math.min(canvas.width - player.width, player.x));
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // ground
+  ctx.fillStyle = '#4a4a68';
+  ctx.fillRect(0, GROUND_Y, canvas.width, canvas.height - GROUND_Y);
+
+  // player (flip color slightly when running for visual feedback)
+  const running = keys['ShiftLeft'] || keys['ShiftRight'];
+  ctx.fillStyle = running ? '#ffb347' : '#66c2ff';
+  ctx.fillRect(player.x, player.y, player.width, player.height);
+
+  // simple facing indicator (a little "nose")
+  ctx.fillStyle = '#111';
+  const noseX = player.facing === 1 ? player.x + player.width - 4 : player.x;
+  ctx.fillRect(noseX, player.y + 8, 4, 4);
+}
+
+function loop() {
+  handleInput();
+  applyPhysics();
+  draw();
+  requestAnimationFrame(loop);
+}
+
+loop();
+</script>
+</body>
+</html>

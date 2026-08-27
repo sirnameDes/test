@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #12141c;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+  }
+  h2 { margin: 4px 0 12px; font-weight: 600; }
+  #joinBox {
+    background: #1c1f2b;
+    padding: 20px 24px;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 260px;
+  }
+  #joinBox input {
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #0f1118;
+    color: #fff;
+    font-size: 14px;
+  }
+  #joinBox button {
+    padding: 10px;
+    border-radius: 8px;
+    border: none;
+    background: #6c5ce7;
+    color: white;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  #joinBox button:hover { background: #5b4bd6; }
+  canvas {
+    background: #0f1118;
+    border-radius: 12px;
+    border: 1px solid #2a2d3a;
+    display: none;
+  }
+  #hud {
+    display: none;
+    margin-top: 8px;
+    font-size: 13px;
+    color: #aaa;
+    text-align: center;
+  }
+  #status { font-size: 12px; color: #777; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<h2>⚔️ Multiplayer Arena</h2>
+
+<div id="joinBox">
+  <input id="nameInput" placeholder="Your name" maxlength="12" />
+  <input id="roomInput" placeholder="Room code (e.g. FOX42)" maxlength="10" style="text-transform:uppercase" />
+  <button id="joinBtn">Join Game</button>
+  <div id="status"></div>
+</div>
+
+<canvas id="game" width="800" height="500"></canvas>
+<div id="hud">WASD/Arrows to move · SPACE or Click to attack</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const joinBox = document.getElementById('joinBox');
+const nameInput = document.getElementById('nameInput');
+const roomInput = document.getElementById('roomInput');
+const joinBtn = document.getElementById('joinBtn');
+const statusEl = document.getElementById('status');
+const hud = document.getElementById('hud');
+
+const PLAYER_SIZE = 28;
+const SPEED = 4;
+const STALE_MS = 8000;        // remove players not seen in this long
+const BROADCAST_MS = 150;     // how often we push our state
+const POLL_MS = 250;          // how often we pull the world
+const ATTACK_RANGE = 55;
+const ATTACK_ARC = Math.PI / 2; // 90 degree swing
+const ATTACK_COOLDOWN = 450;
+const ATTACK_DAMAGE = 15;
+const PLAYER_MAX_HP = 100;
+const HIT_FROM_ENEMY = 8;
+const ENEMY_HIT_COOLDOWN = 700; // per-enemy, how often an enemy can hit you
+const RESPAWN_MS = 1800;
+
+const ENEMY_MAX_HP = 40;
+const ENEMY_SPEED = 1.6;
+const ENEMY_ATTACK_RANGE = 30;
+const MAX_ENEMIES = 4;
+const ENEMY_SPAWN_INTERVAL = 5000;
+const ENEMY_TICK_MS = 200;
+
+let myId = null;
+let myName = '';
+let myColor = '';
+let roomCode = '';
+
+let x = 400, y = 250;
+let facing = { x: 1, y: 0 };
+let hp = PLAYER_MAX_HP;
+let dead = false;
+let respawnAt = 0;
+let lastAttackAt = 0;
+let attackAnimUntil = 0;
+let lastEnemyHitAt = {}; // enemyId -> timestamp
+
+const keys = {};
+let players = {};   // cache from storage
+let enemies = {};   // cache from storage
+let running = false;
+let kills = 0;
+
+function randomColor() {
+  const colors = ['#ff6b6b','#4ecdc4','#ffd93d','#6c5ce7','#a29bfe','#fd79a8','#00cec9','#e17055','#74b9ff','#55efc4'];
+  return colors[Math.floor(Math.random() * colors.length)];
+}
+function makeId(prefix) {
+  return prefix + '_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+function randomRoomCode() {
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  for (let i = 0; i < 4; i++) code += letters[Math.floor(Math.random() * letters.length)];
+  code += Math.floor(10 + Math.random() * 90);
+  return code;
+}
+function playerKey(id) { return 'room:' + roomCode + ':players:' + id; }
+function enemyKey(id) { return 'room:' + roomCode + ':enemies:' + id; }
+function dist(ax, ay, bx, by) { return Math.hypot(ax - bx, ay - by); }
+
+async function joinGame() {
+  const name = nameInput.value.trim() || 'Player';
+  const roomRaw = roomInput.value.trim().toUpperCase();
+  myName = name;
+  myId = makeId('p');
+  myColor = randomColor();
+  roomCode = roomRaw || randomRoomCode();
+
+  joinBox.style.display = 'none';
+  canvas.style.display = 'block';
+  hud.style.display = 'block';
+  hud.textContent = 'Room: ' + roomCode + ' — share this code · WASD/Arrows move · SPACE/Click attack';
+  running = true;
+
+  window.addEventListener('keydown', e => {
+    keys[e.key.toLowerCase()] = true;
+    if (e.key === ' ') { e.preventDefault(); tryAttack(); }
+  });
+  window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+  canvas.addEventListener('mousedown', e => {
+    const rect = canvas.getBoundingClientRect();
+    const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+    facing.x = mx - x; facing.y = my - y;
+    const len = Math.hypot(facing.x, facing.y) || 1;
+    facing.x /= len; facing.y /= len;
+    tryAttack();
+  });
+  window.addEventListener('beforeunload', () => {
+    try { window.storage.delete(playerKey(myId), true); } catch (e) {}
+  });
+
+  await broadcastPosition();
+  gameLoop();
+  netLoop();
+}
+
+function updateMovement() {
+  if (dead) return;
+  let dx = 0, dy = 0;
+  if (keys['w'] || keys['arrowup']) dy -= 1;
+  if (keys['s'] || keys['arrowdown']) dy += 1;
+  if (keys['a'] || keys['arrowleft']) dx -= 1;
+  if (keys['d'] || keys['arrowright']) dx += 1;
+
+  if (dx !== 0 || dy !== 0) {
+    const len = Math.hypot(dx, dy) || 1;
+    facing.x = dx / len; facing.y = dy / len;
+  }
+  if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+
+  x = Math.max(PLAYER_SIZE/2, Math.min(canvas.width - PLAYER_SIZE/2, x + dx * SPEED));
+  y = Math.max(PLAYER_SIZE/2, Math.min(canvas.height - PLAYER_SIZE/2, y + dy * SPEED));
+}
+
+function tryAttack() {
+  if (dead) return;
+  const now = Date.now();
+  if (now - lastAttackAt < ATTACK_COOLDOWN) return;
+  lastAttackAt = now;
+  attackAnimUntil = now + 180;
+
+  // hit any enemy within range + arc in front of us
+  for (const key in enemies) {
+    const en = enemies[key];
+    if (en.hp <= 0) continue;
+    const d = dist(x, y, en.x, en.y);
+    if (d > ATTACK_RANGE) continue;
+    const toEn = { x: en.x - x, y: en.y - y };
+    const enLen = Math.hypot(toEn.x, toEn.y) || 1;
+    const dot = (toEn.x / enLen) * facing.x + (toEn.y / enLen) * facing.y;
+    const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+    if (angle <= ATTACK_ARC / 2) {
+      damageEnemy(key, ATTACK_DAMAGE);
+    }
+  }
+}
+
+async function damageEnemy(key, amount) {
+  try {
+    const res = await window.storage.get(key, true);
+    if (!res) return;
+    const data = JSON.parse(res.value);
+    data.hp = Math.max(0, data.hp - amount);
+    data.t = Date.now();
+    if (data.hp <= 0) {
+      await window.storage.delete(key, true);
+      kills++;
+    } else {
+      await window.storage.set(key, JSON.stringify(data), true);
+    }
+    enemies[key] = data.hp > 0 ? data : undefined;
+    if (data.hp <= 0) delete enemies[key];
+  } catch (e) { console.error('damageEnemy failed', e); }
+}
+
+function checkEnemyContact() {
+  if (dead) return;
+  const now = Date.now();
+  for (const key in enemies) {
+    const en = enemies[key];
+    if (en.hp <= 0) continue;
+    const d = dist(x, y, en.x, en.y);
+    if (d < ENEMY_ATTACK_RANGE) {
+      const last = lastEnemyHitAt[key] || 0;
+      if (now - last > ENEMY_HIT_COOLDOWN) {
+        lastEnemyHitAt[key] = now;
+        hp = Math.max(0, hp - HIT_FROM_ENEMY);
+        if (hp <= 0) onDeath();
+      }
+    }
+  }
+}
+
+function onDeath() {
+  dead = true;
+  respawnAt = Date.now() + RESPAWN_MS;
+}
+
+function maybeRespawn() {
+  if (dead && Date.now() >= respawnAt) {
+    dead = false;
+    hp = PLAYER_MAX_HP;
+    x = 50 + Math.random() * (canvas.width - 100);
+    y = 50 + Math.random() * (canvas.height - 100);
+    lastEnemyHitAt = {};
+  }
+}
+
+async function broadcastPosition() {
+  if (!myId) return;
+  try {
+    await window.storage.set(playerKey(myId), JSON.stringify({
+      name: myName, color: myColor, x, y, hp, dead,
+      attacking: Date.now() < attackAnimUntil,
+      fx: facing.x, fy: facing.y,
+      t: Date.now()
+    }), true);
+  } catch (e) { console.error('broadcast failed', e); }
+}
+
+async function pollWorld() {
+  try {
+    const [pList, eList] = await Promise.all([
+      window.storage.list('room:' + roomCode + ':players:', true),
+      window.storage.list('room:' + roomCode + ':enemies:', true)
+    ]);
+    const now = Date.now();
+
+    if (pList && pList.keys) {
+      const fresh = {};
+      for (const key of pList.keys) {
+        try {
+          const res = await window.storage.get(key, true);
+          if (!res) continue;
+          const data = JSON.parse(res.value);
+          if (now - data.t < STALE_MS) fresh[key] = data;
+        } catch (e) {}
+      }
+      players = fresh;
+    }
+
+    if (eList && eList.keys) {
+      const fresh = {};
+      for (const key of eList.keys) {
+        try {
+          const res = await window.storage.get(key, true);
+          if (!res) continue;
+          const data = JSON.parse(res.value);
+          if (data.hp > 0 && now - data.t < STALE_MS * 2) fresh[key] = data;
+        } catch (e) {}
+      }
+      enemies = fresh;
+    }
+    statusEl.textContent = '';
+  } catch (e) { console.error('poll failed', e); }
+}
+
+// --- Host-only enemy AI: the player with the lexicographically smallest id runs it ---
+let lastEnemyTick = 0;
+let lastSpawnAt = 0;
+
+function amIHost() {
+  const ids = Object.keys(players).map(k => k.split(':').pop()).concat([myId]);
+  ids.sort();
+  return ids[0] === myId;
+}
+
+async function runEnemyAI() {
+  const now = Date.now();
+  if (now - lastEnemyTick < ENEMY_TICK_MS) return;
+  lastEnemyTick = now;
+  if (!amIHost()) return;
+
+  // spawn
+  const aliveCount = Object.keys(enemies).length;
+  if (aliveCount < MAX_ENEMIES && now - lastSpawnAt > ENEMY_SPAWN_INTERVAL) {
+    lastSpawnAt = now;
+    const id = makeId('e');
+    const ex = Math.random() < 0.5 ? 20 : canvas.width - 20;
+    const ey = 20 + Math.random() * (canvas.height - 40);
+    const enemy = { x: ex, y: ey, hp: ENEMY_MAX_HP, maxHp: ENEMY_MAX_HP, t: now };
+    enemies[enemyKey(id)] = enemy;
+    try { await window.storage.set(enemyKey(id), JSON.stringify(enemy), true); } catch (e) {}
+  }
+
+  // move each enemy toward nearest living player
+  const livingPlayers = Object.values(players).filter(p => !p.dead);
+  if (!dead) livingPlayers.push({ x, y, __self: true });
+
+  const updates = [];
+  for (const key in enemies) {
+    const en = enemies[key];
+    if (en.hp <= 0) continue;
+    let nearest = null, best = Infinity;
+    for (const p of livingPlayers) {
+      const d = dist(en.x, en.y, p.x, p.y);
+      if (d < best) { best = d; nearest = p; }
+    }
+    if (nearest && best > ENEMY_ATTACK_RANGE * 0.7) {
+      const dx = nearest.x - en.x, dy = nearest.y - en.y;
+      const len = Math.hypot(dx, dy) || 1;
+      en.x += (dx / len) * ENEMY_SPEED;
+      en.y += (dy / len) * ENEMY_SPEED;
+      en.x = Math.max(10, Math.min(canvas.width - 10, en.x));
+      en.y = Math.max(10, Math.min(canvas.height - 10, en.y));
+    }
+    en.t = now;
+    updates.push(window.storage.set(key, JSON.stringify(en), true).catch(() => {}));
+  }
+  await Promise.all(updates);
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  ctx.strokeStyle = '#1a1d29';
+  ctx.lineWidth = 1;
+  for (let gx = 0; gx < canvas.width; gx += 40) { ctx.beginPath(); ctx.moveTo(gx,0); ctx.lineTo(gx,canvas.height); ctx.stroke(); }
+  for (let gy = 0; gy < canvas.height; gy += 40) { ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(canvas.width,gy); ctx.stroke(); }
+
+  // enemies
+  for (const key in enemies) {
+    const en = enemies[key];
+    drawEnemy(en);
+  }
+
+  // other players
+  for (const key in players) {
+    if (key === playerKey(myId)) continue;
+    const p = players[key];
+    if (p.dead) continue;
+    drawPlayer(p.x, p.y, p.color, p.name, false, p.hp, p.attacking, p.fx, p.fy);
+  }
+
+  // me
+  if (!dead) {
+    drawPlayer(x, y, myColor, myName + ' (you)', true, hp, Date.now() < attackAnimUntil, facing.x, facing.y);
+  } else {
+    ctx.fillStyle = '#ff6b6b';
+    ctx.font = 'bold 22px system-ui';
+    ctx.textAlign = 'center';
+    const secsLeft = Math.max(0, Math.ceil((respawnAt - Date.now()) / 1000));
+    ctx.fillText('You died — respawning in ' + secsLeft + 's', canvas.width/2, canvas.height/2);
+  }
+
+  const pCount = Object.keys(players).length + (dead ? 0 : 1);
+  ctx.fillStyle = '#888';
+  ctx.font = '12px system-ui';
+  ctx.textAlign = 'left';
+  ctx.fillText(pCount + ' player(s) · ' + Object.keys(enemies).length + ' enemies · room ' + roomCode + ' · kills: ' + kills, 10, canvas.height - 10);
+}
+
+function drawHealthBar(px, py, hpVal, maxHp, width, color) {
+  const w = width, h = 5;
+  const bx = px - w/2, by = py - PLAYER_SIZE/2 - 20;
+  ctx.fillStyle = '#333';
+  ctx.fillRect(bx, by, w, h);
+  ctx.fillStyle = color;
+  ctx.fillRect(bx, by, w * Math.max(0, hpVal / maxHp), h);
+}
+
+function drawPlayer(px, py, color, label, isMe, hpVal, attacking, fx, fy) {
+  if (attacking) {
+    ctx.save();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 3;
+    ctx.globalAlpha = 0.7;
+    const ang = Math.atan2(fy || 0, fx || 1);
+    ctx.beginPath();
+    ctx.arc(px, py, ATTACK_RANGE, ang - ATTACK_ARC/2, ang + ATTACK_ARC/2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur = isMe ? 15 : 6;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(px, py, PLAYER_SIZE/2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  drawHealthBar(px, py, hpVal ?? PLAYER_MAX_HP, PLAYER_MAX_HP, 36, '#4ecdc4');
+
+  ctx.fillStyle = '#fff';
+  ctx.font = isMe ? 'bold 12px system-ui' : '12px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, px, py - PLAYER_SIZE/2 - 26);
+}
+
+function drawEnemy(en) {
+  ctx.save();
+  ctx.shadowColor = '#ff3b3b';
+  ctx.shadowBlur = 10;
+  ctx.fillStyle = '#c0392b';
+  ctx.beginPath();
+  const s = 22;
+  ctx.moveTo(en.x, en.y - s/2);
+  ctx.lineTo(en.x + s/2, en.y + s/2);
+  ctx.lineTo(en.x - s/2, en.y + s/2);
+  ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+
+  drawHealthBar(en.x, en.y, en.hp, en.maxHp || ENEMY_MAX_HP, 30, '#ff6b6b');
+}
+
+function gameLoop() {
+  if (!running) return;
+  maybeRespawn();
+  updateMovement();
+  checkEnemyContact();
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+let lastBroadcast = 0;
+function netLoop() {
+  if (!running) return;
+  const now = Date.now();
+  if (now - lastBroadcast > BROADCAST_MS) {
+    lastBroadcast = now;
+    broadcastPosition();
+  }
+  pollWorld().then(runEnemyAI);
+  setTimeout(netLoop, POLL_MS);
+}
+
+joinBtn.addEventListener('click', joinGame);
+nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') joinGame(); });
+roomInput.addEventListener('keydown', e => { if (e.key === 'Enter') joinGame(); });
+</script>
+
+</body>
+</html>
