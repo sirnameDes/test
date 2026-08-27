@@ -1,0 +1,266 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, sans-serif;
+    background: #12141c;
+    color: #eee;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px;
+  }
+  h2 { margin: 4px 0 12px; font-weight: 600; }
+  #joinBox {
+    background: #1c1f2b;
+    padding: 20px 24px;
+    border-radius: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    width: 260px;
+  }
+  #joinBox input {
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #444;
+    background: #0f1118;
+    color: #fff;
+    font-size: 14px;
+  }
+  #joinBox button {
+    padding: 10px;
+    border-radius: 8px;
+    border: none;
+    background: #6c5ce7;
+    color: white;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  #joinBox button:hover { background: #5b4bd6; }
+  canvas {
+    background: #0f1118;
+    border-radius: 12px;
+    border: 1px solid #2a2d3a;
+    display: none;
+  }
+  #hud {
+    display: none;
+    margin-top: 8px;
+    font-size: 13px;
+    color: #aaa;
+  }
+  #status { font-size: 12px; color: #777; margin-top: 6px; }
+</style>
+</head>
+<body>
+
+<h2>🎮 Multiplayer Arena</h2>
+
+<div id="joinBox">
+  <input id="nameInput" placeholder="Your name" maxlength="12" />
+  <input id="roomInput" placeholder="Room code (e.g. FOX42)" maxlength="10" style="text-transform:uppercase" />
+  <button id="joinBtn">Join Game</button>
+  <div id="status"></div>
+</div>
+
+<canvas id="game" width="800" height="500"></canvas>
+<div id="hud">WASD / Arrow keys to move · Share your room code so friends join the same game</div>
+
+<script>
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const joinBox = document.getElementById('joinBox');
+const nameInput = document.getElementById('nameInput');
+const roomInput = document.getElementById('roomInput');
+const joinBtn = document.getElementById('joinBtn');
+const statusEl = document.getElementById('status');
+const hud = document.getElementById('hud');
+
+const PLAYER_SIZE = 28;
+const SPEED = 4;
+const STALE_MS = 8000; // remove players not seen in 8s
+const BROADCAST_MS = 150;
+
+let myId = null;
+let myName = '';
+let myColor = '';
+let roomCode = '';
+let x = 400, y = 250;
+const keys = {};
+let players = {}; // cache of last known players
+let running = false;
+
+function randomColor() {
+  const colors = ['#ff6b6b','#4ecdc4','#ffd93d','#6c5ce7','#a29bfe','#fd79a8','#00cec9','#e17055','#74b9ff','#55efc4'];
+  return colors[Math.floor(Math.random() * colors.length)];
+}
+
+function makeId() {
+  return 'p_' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+}
+
+function randomRoomCode() {
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  let code = '';
+  for (let i = 0; i < 4; i++) code += letters[Math.floor(Math.random() * letters.length)];
+  code += Math.floor(10 + Math.random() * 90);
+  return code;
+}
+
+function storageKey(id) {
+  return 'room:' + roomCode + ':players:' + id;
+}
+
+async function joinGame() {
+  const name = nameInput.value.trim() || 'Player';
+  const roomRaw = roomInput.value.trim().toUpperCase();
+  myName = name;
+  myId = makeId();
+  myColor = randomColor();
+  roomCode = roomRaw || randomRoomCode();
+
+  joinBox.style.display = 'none';
+  canvas.style.display = 'block';
+  hud.style.display = 'block';
+  hud.textContent = 'Room: ' + roomCode + ' — share this code so friends join the same game · WASD / Arrows to move';
+  running = true;
+
+  window.addEventListener('keydown', e => keys[e.key.toLowerCase()] = true);
+  window.addEventListener('keyup', e => keys[e.key.toLowerCase()] = false);
+  window.addEventListener('beforeunload', () => {
+    // best-effort cleanup
+    try { window.storage.delete(storageKey(myId), true); } catch (e) {}
+  });
+
+  await broadcastPosition();
+  gameLoop();
+  pollLoop();
+}
+
+function updateMovement() {
+  let dx = 0, dy = 0;
+  if (keys['w'] || keys['arrowup']) dy -= 1;
+  if (keys['s'] || keys['arrowdown']) dy += 1;
+  if (keys['a'] || keys['arrowleft']) dx -= 1;
+  if (keys['d'] || keys['arrowright']) dx += 1;
+
+  if (dx !== 0 && dy !== 0) { dx *= 0.707; dy *= 0.707; }
+
+  x = Math.max(PLAYER_SIZE/2, Math.min(canvas.width - PLAYER_SIZE/2, x + dx * SPEED));
+  y = Math.max(PLAYER_SIZE/2, Math.min(canvas.height - PLAYER_SIZE/2, y + dy * SPEED));
+}
+
+async function broadcastPosition() {
+  if (!myId) return;
+  try {
+    await window.storage.set(storageKey(myId), JSON.stringify({
+      name: myName,
+      color: myColor,
+      x, y,
+      t: Date.now()
+    }), true);
+  } catch (e) {
+    console.error('broadcast failed', e);
+  }
+}
+
+async function pollPlayers() {
+  try {
+    const list = await window.storage.list('room:' + roomCode + ':players:', true);
+    if (!list || !list.keys) return;
+    const now = Date.now();
+    const fresh = {};
+    for (const key of list.keys) {
+      try {
+        const res = await window.storage.get(key, true);
+        if (!res) continue;
+        const data = JSON.parse(res.value);
+        if (now - data.t < STALE_MS) {
+          fresh[key] = data;
+        }
+      } catch (e) { /* skip bad entry */ }
+    }
+    players = fresh;
+    statusEl.textContent = '';
+  } catch (e) {
+    console.error('poll failed', e);
+  }
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // grid background
+  ctx.strokeStyle = '#1a1d29';
+  ctx.lineWidth = 1;
+  for (let gx = 0; gx < canvas.width; gx += 40) {
+    ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke();
+  }
+  for (let gy = 0; gy < canvas.height; gy += 40) {
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
+  }
+
+  // other players
+  for (const key in players) {
+    if (key === storageKey(myId)) continue;
+    const p = players[key];
+    drawPlayer(p.x, p.y, p.color, p.name, false);
+  }
+
+  // me (drawn on top)
+  drawPlayer(x, y, myColor, myName + ' (you)', true);
+
+  const count = Object.keys(players).length || 1;
+  ctx.fillStyle = '#888';
+  ctx.font = '12px system-ui';
+  ctx.fillText(count + ' player' + (count === 1 ? '' : 's') + ' online — room ' + roomCode, 10, canvas.height - 10);
+}
+
+function drawPlayer(px, py, color, label, isMe) {
+  ctx.save();
+  ctx.shadowColor = color;
+  ctx.shadowBlur = isMe ? 15 : 6;
+  ctx.fillStyle = color;
+  ctx.beginPath();
+  ctx.arc(px, py, PLAYER_SIZE/2, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.fillStyle = '#fff';
+  ctx.font = isMe ? 'bold 12px system-ui' : '12px system-ui';
+  ctx.textAlign = 'center';
+  ctx.fillText(label, px, py - PLAYER_SIZE/2 - 8);
+}
+
+function gameLoop() {
+  if (!running) return;
+  updateMovement();
+  draw();
+  requestAnimationFrame(gameLoop);
+}
+
+let lastBroadcast = 0;
+function pollLoop() {
+  if (!running) return;
+  const now = Date.now();
+  if (now - lastBroadcast > BROADCAST_MS) {
+    lastBroadcast = now;
+    broadcastPosition();
+  }
+  pollPlayers();
+  setTimeout(pollLoop, 300);
+}
+
+joinBtn.addEventListener('click', joinGame);
+nameInput.addEventListener('keydown', e => { if (e.key === 'Enter') joinGame(); });
+roomInput.addEventListener('keydown', e => { if (e.key === 'Enter') joinGame(); });
+</script>
+
+</body>
+</html>
